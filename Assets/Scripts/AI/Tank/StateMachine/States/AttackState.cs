@@ -5,9 +5,8 @@ namespace CE6127.Tanks.AI
     /// <summary>
     /// Class <c>AttackState</c> represents the state of the tank when it is engaging the player.
     /// <para>
-    /// The tank stops in place, turns its hull onto the predicted (led) aim point, and fires
-    /// while stationary. It hands back to <see cref="ChaseState"/> whenever the target moves
-    /// out of range or out of sight, so the vehicle only ever shoots from a standstill.
+    /// The tank orbits the target to keep its distance and stay evasive, aims at the predicted
+    /// (led) target position, and fires whenever a clean shot is available.
     /// </para>
     /// </summary>
     internal class AttackState : BaseState
@@ -26,7 +25,7 @@ namespace CE6127.Tanks.AI
         {
             base.Enter();
             m_TankSM.SetStopDistanceToZero();
-            m_TankSM.StopToAim();
+            m_TankSM.InitOrbitAngle();
         }
 
         /// <summary>
@@ -45,7 +44,7 @@ namespace CE6127.Tanks.AI
             float distance = m_TankSM.DistanceToTarget();
             bool hasLos = m_TankSM.HasLineOfSightToTarget();
 
-            // Reposition (drive again) if the target slipped out of range or out of sight.
+            // Reposition if the target slipped out of range or out of sight.
             if (distance > m_TankSM.OrbitRadius() * 2.2f ||
                 (!hasLos && distance > m_TankSM.OrbitRadius() * 1.5f))
             {
@@ -53,8 +52,16 @@ namespace CE6127.Tanks.AI
                 return;
             }
 
-            // Standing fire: turn the hull onto the predicted lead point and shoot. The tank is
-            // already stopped (StopToAim on enter) and only rotates in place, never drifts.
+            // Circle the target to keep distance and throw off return fire.
+            m_TankSM.AdvanceOrbitAngle();
+
+            if (Time.time >= m_TankSM.NavMeshUpdateDeadline)
+            {
+                m_TankSM.NavMeshUpdateDeadline = Time.time + m_TankSM.TargetNavMeshUpdate;
+                m_TankSM.NavMeshAgent.SetDestination(m_TankSM.OrbitPoint());
+            }
+
+            // Aim at the predicted target position and fire when ready.
             Vector3 lead = m_TankSM.PredictTargetPoint();
             m_TankSM.RotateTowards(lead - m_TankSM.transform.position);
             m_TankSM.TryFire();

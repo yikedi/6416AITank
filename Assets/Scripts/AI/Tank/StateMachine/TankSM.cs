@@ -139,9 +139,8 @@ namespace CE6127.Tanks.AI
         {
             NavMeshAgent.speed = GameManager.Speed;
             NavMeshAgent.angularSpeed = GameManager.AngularSpeed;
-            // Driving: the agent rotates the hull onto its heading so the tank only ever
-            // moves forward (no sideways drift). See ResumeDriving / StopToAim.
-            NavMeshAgent.updateRotation = true;
+            // The hull is rotated manually so it can face the target while strafing around it.
+            NavMeshAgent.updateRotation = false;
         }
 
         /// <summary>
@@ -153,30 +152,6 @@ namespace CE6127.Tanks.AI
         /// Method <c>SetStopDistanceToTarget</c> sets the NavMeshAgent's stopping distance to the target's distance.
         /// </summary>
         public void SetStopDistanceToTarget() => NavMeshAgent.stoppingDistance = StopDistance;
-
-        /// <summary>
-        /// Method <c>ResumeDriving</c> puts the tank back in driving mode: the agent steers the
-        /// hull to face the direction of travel, so the tank advances head-on and never slides
-        /// sideways. Call it whenever the tank should move (patrol, pursuit, repositioning).
-        /// </summary>
-        public void ResumeDriving()
-        {
-            NavMeshAgent.updateRotation = true;
-            NavMeshAgent.isStopped = false;
-        }
-
-        /// <summary>
-        /// Method <c>StopToAim</c> halts the tank so it can aim and fire in place: the agent no
-        /// longer moves or rotates, and the hull is turned manually onto the aim point. Manual
-        /// rotation must only ever happen while the tank is stopped, otherwise the vehicle would
-        /// drift sideways as the agent pushes one way while the hull faces another.
-        /// </summary>
-        public void StopToAim()
-        {
-            NavMeshAgent.velocity = Vector3.zero;
-            NavMeshAgent.isStopped = true;
-            NavMeshAgent.updateRotation = false;
-        }
 
         /// <summary>
         /// Method <c>Awake</c> is called when the script instance is being loaded.

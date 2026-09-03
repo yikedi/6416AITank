@@ -23,7 +23,6 @@ namespace CE6127.Tanks.AI
         {
             base.Enter();
             m_TankSM.SetStopDistanceToZero();
-            m_TankSM.ResumeDriving();
         }
 
         /// <summary>
@@ -39,7 +38,7 @@ namespace CE6127.Tanks.AI
                 return;
             }
 
-            // Stop to engage once we are inside the preferred engagement distance.
+            // Start engaging once we are inside the orbit range.
             if (m_TankSM.DistanceToTarget() <= m_TankSM.OrbitRadius() * 1.2f)
             {
                 m_StateMachine.ChangeState(m_TankSM.m_States.Attack);
@@ -51,6 +50,13 @@ namespace CE6127.Tanks.AI
                 m_TankSM.NavMeshUpdateDeadline = Time.time + m_TankSM.TargetNavMeshUpdate;
                 m_TankSM.NavMeshAgent.SetDestination(PursuitPoint());
             }
+
+            // Face the direction of travel while closing in.
+            if (m_TankSM.NavMeshAgent.velocity.sqrMagnitude > 0.01f)
+                m_TankSM.RotateTowards(m_TankSM.NavMeshAgent.velocity);
+
+            // Take opportunistic shots while advancing.
+            m_TankSM.TryFire();
         }
 
         /// <summary>
@@ -67,7 +73,7 @@ namespace CE6127.Tanks.AI
             if (m_TankSM.AssignedRole == TankSM.Role.Pusher)
                 return m_TankSM.Target.position;
 
-            // Flankers approach a point offset to one side of the target.
+            // Flankers approach a point on the orbit circle offset to one side.
             float offsetAngle = m_TankSM.AssignedRole == TankSM.Role.LeftFlank ? -55f : 55f;
             Vector3 flankDirection = Quaternion.Euler(0f, offsetAngle, 0f) * direction;
             return m_TankSM.Target.position + flankDirection * m_TankSM.OrbitRadius();
