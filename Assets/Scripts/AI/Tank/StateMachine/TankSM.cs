@@ -100,7 +100,7 @@ namespace CE6127.Tanks.AI
         [Tooltip("Force given to the shell if the fire button is not held, and the force given to the shell if the fire button is held for the max charge time in seconds.")]
         public Vector2 LaunchForceMinMax = new(6.5f, 30f);          // The force given to the shell if the fire button is not held, and the force given to the shell if the fire button is held for the max charge time.
         [Tooltip("Height at which the shell crosses the target's plane, as a fraction of the launch height. 1 = skims the tank top at barrel height (tends to fly over), 0.7 = drops onto the hull, 0 = lands on the ground.")]
-        [Range(0f, 1f)] public float PassHeightFactor = 0.7f;       // Intercept height for MaxForceWithoutOvershoot as a fraction of m_LaunchHeight.
+        [Range(0f, 1f)] public float PassHeightFactor = 1.0f;       // Intercept height for MaxForceWithoutOvershoot as a fraction of m_LaunchHeight.
 
         [Header("References")]
         [Tooltip("Prefab")] public Rigidbody Shell;                 // Prefab of the shell.
