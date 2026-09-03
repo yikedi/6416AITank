@@ -2,17 +2,18 @@ using System.Collections;
 using UnityEngine;
 
 using Random = UnityEngine.Random;
-using Debug = UnityEngine.Debug;
 
 namespace CE6127.Tanks.AI
 {
     /// <summary>
-    /// Class <c>PatrollingState</c> represents the state of the tank when it is patrolling.
+    /// Class <c>PatrollingState</c> represents the state of the tank when it is searching
+    /// for the player. It wanders the map until a target comes within acquisition range.
     /// </summary>
     internal class PatrollingState : BaseState
     {
-        private TankSM m_TankSM;        // Reference to the tank state machine.
-        private Vector3 m_Destination;  // Destination for the tank to move to.
+        private TankSM m_TankSM;           // Reference to the tank state machine.
+        private Vector3 m_Destination;     // Destination for the tank to move to.
+        private Coroutine m_PatrolRoutine; // Handle to the running patrol coroutine.
 
         /// <summary>
         /// Constructor <c>PatrollingState</c> constructor.
@@ -25,10 +26,8 @@ namespace CE6127.Tanks.AI
         public override void Enter()
         {
             base.Enter();
-
             m_TankSM.SetStopDistanceToZero();
-
-            m_TankSM.StartCoroutine(Patrolling());
+            m_PatrolRoutine = m_TankSM.StartCoroutine(Patrolling());
         }
 
         /// <summary>
@@ -37,11 +36,12 @@ namespace CE6127.Tanks.AI
         public override void Update()
         {
             base.Update();
-            if (m_TankSM.Target != null)
+
+            // The player's position is always known, so pursue as soon as a target exists.
+            if (m_TankSM.HasTarget())
             {
-                var dist = Vector3.Distance(m_TankSM.transform.position, m_TankSM.Target.position);
-                if (dist <= m_TankSM.StopDistance) // ... Obviously this doesn't make much sense, but it's just for demonstration purposes.
-                    m_StateMachine.ChangeState(m_TankSM.m_States.Idle);
+                m_StateMachine.ChangeState(m_TankSM.m_States.Chase);
+                return;
             }
 
             if (Time.time >= m_TankSM.NavMeshUpdateDeadline)
@@ -49,6 +49,10 @@ namespace CE6127.Tanks.AI
                 m_TankSM.NavMeshUpdateDeadline = Time.time + m_TankSM.PatrolNavMeshUpdate;
                 m_TankSM.NavMeshAgent.SetDestination(m_Destination);
             }
+
+            // Face the direction of travel while searching.
+            if (m_TankSM.NavMeshAgent.velocity.sqrMagnitude > 0.01f)
+                m_TankSM.RotateTowards(m_TankSM.NavMeshAgent.velocity);
         }
 
         /// <summary>
@@ -58,7 +62,9 @@ namespace CE6127.Tanks.AI
         {
             base.Exit();
 
-            m_TankSM.StopCoroutine(Patrolling());
+            if (m_PatrolRoutine != null)
+                m_TankSM.StopCoroutine(m_PatrolRoutine);
+            m_PatrolRoutine = null;
         }
 
         /// <summary>
