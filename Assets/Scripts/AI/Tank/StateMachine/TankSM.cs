@@ -89,6 +89,7 @@ namespace CE6127.Tanks.AI
         [HideInInspector] public Transform Target;                  // Reference to the target's transform.
         [HideInInspector] public float NavMeshUpdateDeadline;       // The time when the next path update is due.
         [HideInInspector] public Vector3 TargetVelocity;            // The smoothed velocity of the target (for lead prediction).
+        [HideInInspector] public float TargetAngularVelocity;       // The smoothed turn rate of the target (deg/s, for curved lead prediction).
         [HideInInspector] public Role AssignedRole = Role.Pusher;   // This tank's role in the platoon formation.
         [HideInInspector] public int StrafeSign = 1;                // +1 orbits counter-clockwise, -1 clockwise.
         [HideInInspector] public float OrbitAngle;                  // Current angular position of the tank around the target.
@@ -116,6 +117,7 @@ namespace CE6127.Tanks.AI
         private float m_LaunchHeight;                               // Height of the barrel above the tank origin.
         private float m_MaxFireRange;                               // Furthest distance a shell can still reach.
         private Vector3 m_PrevTargetPosition;                       // Used to estimate the target's velocity.
+        private Vector3 m_PrevTargetForward;                        // Used to estimate the target's turn rate.
         private bool m_TargetTracked;                               // Whether target velocity tracking has started.
 
         /// <summary>
@@ -312,28 +314,47 @@ namespace CE6127.Tanks.AI
         }
 
         /// <summary>
-        /// Method <c>TickTargetTracking</c> estimates the target's velocity for lead prediction.
+        /// Method <c>TickTargetTracking</c> estimates the target's linear and angular velocity
+        /// for lead prediction. Both are frame-differenced and smoothed, with the turn rate
+        /// clamped to the target's maximum (180°/s).
         /// </summary>
         public void TickTargetTracking()
         {
             if (!HasTarget())
             {
                 TargetVelocity = Vector3.zero;
+                TargetAngularVelocity = 0f;
                 m_TargetTracked = false;
                 return;
             }
 
+            // Horizontal forward direction of the target, used to estimate its turn rate.
+            Vector3 forward = Target.forward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.0001f)
+                forward = transform.forward;
+            forward.Normalize();
+
             if (!m_TargetTracked)
             {
                 m_PrevTargetPosition = Target.position;
+                m_PrevTargetForward = forward;
                 TargetVelocity = Vector3.zero;
+                TargetAngularVelocity = 0f;
                 m_TargetTracked = true;
                 return;
             }
 
+            // Linear velocity: frame-differenced position, smoothed.
             Vector3 instant = (Target.position - m_PrevTargetPosition) / Mathf.Max(Time.deltaTime, 1e-4f);
             TargetVelocity = Vector3.Lerp(TargetVelocity, instant, 0.4f);
             m_PrevTargetPosition = Target.position;
+
+            // Angular velocity: signed angle between consecutive forward directions (deg/s).
+            float angleDeg = Vector3.SignedAngle(m_PrevTargetForward, forward, Vector3.up);
+            float instantAngular = angleDeg / Mathf.Max(Time.deltaTime, 1e-4f);
+            TargetAngularVelocity = Mathf.Clamp(Mathf.Lerp(TargetAngularVelocity, instantAngular, 0.4f), -180f, 180f);
+            m_PrevTargetForward = forward;
         }
 
         /// <summary>
@@ -398,27 +419,94 @@ namespace CE6127.Tanks.AI
         }
 
         /// <summary>
-        /// Method <c>PredictTargetPoint</c> returns the world position to aim at, leading the target
-        /// by its estimated velocity and the shell flight time.
+        /// Method <c>MaxForceWithoutOvershoot</c> returns the fastest shell speed that still passes
+        /// through the tank's top (height = launch height) at the given horizontal distance — i.e.
+        /// the strongest shot that does not fly over the target's head.
+        /// </summary>
+        public float MaxForceWithoutOvershoot(float horizontalDistance)
+        {
+            float g = Mathf.Max(Physics.gravity.magnitude, 0.01f);
+            float sin2 = Mathf.Sin(2f * m_BarrelPitchRad);
+            if (sin2 <= 0f)
+                return LaunchForceMinMax.y;
+
+            float v = Mathf.Sqrt(g * Mathf.Max(0f, horizontalDistance) / sin2);
+            return Mathf.Clamp(v, LaunchForceMinMax.x, LaunchForceMinMax.y);
+        }
+
+        /// <summary>
+        /// Method <c>FlightTime</c> returns how long a shell fired with
+        /// <see cref="MaxForceWithoutOvershoot"/> takes to cover the given horizontal distance.
+        /// </summary>
+        public float FlightTime(float horizontalDistance)
+        {
+            float v = MaxForceWithoutOvershoot(horizontalDistance);
+            float speed = Mathf.Max(v * Mathf.Cos(m_BarrelPitchRad), 0.1f);
+            return horizontalDistance / speed;
+        }
+
+        /// <summary>
+        /// Method <c>PredictTargetPoint</c> returns the world position to aim at.
+        /// <para>
+        /// The target's future positions are sampled along its curved path (current linear and
+        /// angular velocity) over the next 1.5s at 0.1s steps. Each sample is scored by whether
+        /// the shell can arrive exactly when the target does: <c>rotateTime + flightTime ≈ t</c>.
+        /// The earliest sample that can be hit on time wins; the closest match is the fallback.
+        /// </para>
         /// </summary>
         public Vector3 PredictTargetPoint()
         {
             if (!HasTarget())
                 return transform.position + transform.forward * 10f;
 
-            Vector3 predicted = Target.position;
-            for (var i = 0; i < 8; ++i)
+            const float horizon = 1.5f;
+            const int sampleCount = 40;             // Number of future-path samples over the horizon.
+            const float step = horizon / sampleCount;
+            const float rotSpeed = 180f;            // NavMeshAgent.angularSpeed (deg/s).
+            const float timingTolerance = 0.05f;    // ~0.4m of travel at 8 m/s.
+
+            Vector3 forward = FireTransform.forward;
+            forward.y = 0f;
+            if (forward.sqrMagnitude < 0.0001f)
+                forward = transform.forward;
+            forward.Normalize();
+
+            // Integrate the target's curved path, checking each sample as we go.
+            Vector3 pos = Target.position;
+            Vector3 vel = TargetVelocity;
+
+            Vector3 bestAim = Target.position;
+            float bestDiff = float.MaxValue;
+
+            for (int i = 1; i <= sampleCount; ++i)
             {
-                // Use horizontal distance so the flight time matches the horizontal speed component.
-                Vector3 delta = predicted - FireTransform.position;
+                float t = i * step;
+
+                vel = Quaternion.Euler(0f, TargetAngularVelocity * step, 0f) * vel;
+                pos += vel * step;
+
+                Vector3 delta = pos - FireTransform.position;
                 delta.y = 0f;
-                float horizontal = delta.magnitude;
-                float speed = Mathf.Max(LaunchForceForDistance(horizontal), 0.1f) * Mathf.Cos(m_BarrelPitchRad);
-                float flightTime = horizontal / Mathf.Max(speed, 1f);
-                predicted = Target.position + TargetVelocity * flightTime;
+                float d = delta.magnitude;
+                if (d < 0.01f)
+                    continue;
+
+                float rotateTime = Vector3.Angle(forward, delta) / rotSpeed;
+                float flightTime = FlightTime(d);
+                float diff = Mathf.Abs(rotateTime + flightTime - t);
+
+                if (diff < bestDiff)
+                {
+                    bestDiff = diff;
+                    bestAim = pos;
+                }
+
+                // Earliest sample that can be hit on time.
+                if (diff <= timingTolerance)
+                    return pos;
             }
 
-            return predicted;
+            return bestAim;
         }
 
         /// <summary>
@@ -529,7 +617,7 @@ namespace CE6127.Tanks.AI
             if (!HasLineOfSightToTarget())
                 return false;
 
-            LaunchProjectile(LaunchForceForDistance(aimDistance));
+            LaunchProjectile(MaxForceWithoutOvershoot(aimDistance));
             m_NextFireTime = Time.time + FireInterval.x;
             return true;
         }
