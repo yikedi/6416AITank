@@ -99,6 +99,8 @@ namespace CE6127.Tanks.AI
         public Vector2 FireInterval = new(0.7f, 2.5f);              // A minimum and maximum cooldown time delay between each firing.
         [Tooltip("Force given to the shell if the fire button is not held, and the force given to the shell if the fire button is held for the max charge time in seconds.")]
         public Vector2 LaunchForceMinMax = new(6.5f, 30f);          // The force given to the shell if the fire button is not held, and the force given to the shell if the fire button is held for the max charge time.
+        [Tooltip("Height at which the shell crosses the target's plane, as a fraction of the launch height. 1 = skims the tank top at barrel height (tends to fly over), 0.7 = drops onto the hull, 0 = lands on the ground.")]
+        [Range(0f, 1f)] public float PassHeightFactor = 0.7f;       // Intercept height for MaxForceWithoutOvershoot as a fraction of m_LaunchHeight.
 
         [Header("References")]
         [Tooltip("Prefab")] public Rigidbody Shell;                 // Prefab of the shell.
@@ -419,19 +421,27 @@ namespace CE6127.Tanks.AI
         }
 
         /// <summary>
-        /// Method <c>MaxForceWithoutOvershoot</c> returns the fastest shell speed that still passes
-        /// through the tank's top (height = launch height) at the given horizontal distance — i.e.
-        /// the strongest shot that does not fly over the target's head.
+        /// Method <c>MaxForceWithoutOvershoot</c> returns the fastest shell speed whose trajectory
+        /// crosses the target's vertical plane at <see cref="PassHeightFactor"/> × launch height.
+        /// With the factor at 1 the shell returns to barrel height at the target (it skims the roof
+        /// and tends to fly over); lowering it makes the shell drop onto the hull instead.
         /// </summary>
         public float MaxForceWithoutOvershoot(float horizontalDistance)
         {
             float g = Mathf.Max(Physics.gravity.magnitude, 0.01f);
-            float sin2 = Mathf.Sin(2f * m_BarrelPitchRad);
-            if (sin2 <= 0f)
+            float cos = Mathf.Cos(m_BarrelPitchRad);
+            float tan = Mathf.Tan(m_BarrelPitchRad);
+
+            // Vertical drop below the launch line required by the time the shell covers d.
+            float drop = (1f - Mathf.Clamp01(PassHeightFactor)) * m_LaunchHeight;
+
+            // y(d) = h + d·tanθ − g·d²/(2·v²·cos²θ) = PassHeightFactor·h  ⇒  solve for v.
+            float denom = 2f * cos * cos * (horizontalDistance * tan + drop);
+            if (denom <= 0f)
                 return LaunchForceMinMax.y;
 
-            float v = Mathf.Sqrt(g * Mathf.Max(0f, horizontalDistance) / sin2);
-            return Mathf.Clamp(v, LaunchForceMinMax.x, LaunchForceMinMax.y);
+            float vSqr = g * horizontalDistance * horizontalDistance / denom;
+            return Mathf.Clamp(Mathf.Sqrt(Mathf.Max(0f, vSqr)), LaunchForceMinMax.x, LaunchForceMinMax.y);
         }
 
         /// <summary>
