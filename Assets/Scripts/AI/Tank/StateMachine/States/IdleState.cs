@@ -3,8 +3,8 @@ using UnityEngine;
 namespace CE6127.Tanks.AI
 {
     /// <summary>
-    /// Class <c>IdleState</c> represents the initial state of the tank. It orients the hull
-    /// toward the target and hands off to <see cref="ChaseState"/> or <see cref="PatrollingState"/>.
+    /// Class <c>IdleState</c> represents the initial state of the tank. It starts the tank in
+    /// driving mode and hands off to <see cref="ChaseState"/> or <see cref="PatrollingState"/>.
     /// </summary>
     internal class IdleState : BaseState
     {
@@ -22,8 +22,8 @@ namespace CE6127.Tanks.AI
         {
             base.Update();
 
-            if (m_TankSM.HasTarget())
-                m_TankSM.RotateTowards(m_TankSM.Target.position - m_TankSM.transform.position);
+            // Ensure driving mode (hull follows heading) before handing off.
+            m_TankSM.ResumeDriving();
 
             // The player's position is always known, so head straight into pursuit.
             if (!m_TankSM.HasTarget())

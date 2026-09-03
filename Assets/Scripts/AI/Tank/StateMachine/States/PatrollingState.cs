@@ -27,6 +27,7 @@ namespace CE6127.Tanks.AI
         {
             base.Enter();
             m_TankSM.SetStopDistanceToZero();
+            m_TankSM.ResumeDriving();
             m_PatrolRoutine = m_TankSM.StartCoroutine(Patrolling());
         }
 
@@ -49,10 +50,6 @@ namespace CE6127.Tanks.AI
                 m_TankSM.NavMeshUpdateDeadline = Time.time + m_TankSM.PatrolNavMeshUpdate;
                 m_TankSM.NavMeshAgent.SetDestination(m_Destination);
             }
-
-            // Face the direction of travel while searching.
-            if (m_TankSM.NavMeshAgent.velocity.sqrMagnitude > 0.01f)
-                m_TankSM.RotateTowards(m_TankSM.NavMeshAgent.velocity);
         }
 
         /// <summary>
