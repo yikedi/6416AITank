@@ -11,7 +11,8 @@ namespace CE6127.Tanks.AI
     /// </summary>
     internal class AttackState : BaseState
     {
-        private TankSM m_TankSM; // Reference to the tank state machine.
+        private TankSM m_TankSM;     // Reference to the tank state machine.
+        private float m_LastLosTime; // Last time the player was visible, used to debounce cover flicker.
 
         /// <summary>
         /// Constructor <c>AttackState</c> constructor.
@@ -26,6 +27,7 @@ namespace CE6127.Tanks.AI
             base.Enter();
             m_TankSM.SetStopDistanceToZero();
             m_TankSM.InitOrbitAngle();
+            m_LastLosTime = Time.time;
         }
 
         /// <summary>
@@ -42,28 +44,29 @@ namespace CE6127.Tanks.AI
             }
 
             float distance = m_TankSM.DistanceToTarget();
-            bool hasLos = m_TankSM.HasLineOfSightToTarget();
+            if (m_TankSM.HasLineOfSightToTarget())
+                m_LastLosTime = Time.time;
 
-            // Reposition if the target slipped out of range or out of sight.
-            if (distance > m_TankSM.OrbitRadius() * 2.2f ||
-                (!hasLos && distance > m_TankSM.OrbitRadius() * 1.5f))
+            // Match Chase's wider entry gate. The grace period prevents state ping-pong when
+            // the player briefly flickers behind a rock.
+            if (distance > m_TankSM.MaxFireRange * 0.95f || Time.time - m_LastLosTime > 0.75f)
             {
                 m_StateMachine.ChangeState(m_TankSM.m_States.Chase);
                 return;
             }
 
-            // Circle the target to keep distance and throw off return fire.
-            m_TankSM.AdvanceOrbitAngle();
+            // A ring waypoint owns movement during encirclement; normal orbiting resumes after
+            // the handoff into close combat.
+            if (!m_TankSM.ShouldEncircle())
+                m_TankSM.AdvanceOrbitAngle();
 
             if (Time.time >= m_TankSM.NavMeshUpdateDeadline)
             {
                 m_TankSM.NavMeshUpdateDeadline = Time.time + m_TankSM.TargetNavMeshUpdate;
-                m_TankSM.NavMeshAgent.SetDestination(m_TankSM.OrbitPoint());
+                m_TankSM.NavMeshAgent.SetDestination(m_TankSM.MovementDestination(true));
             }
 
-            // Aim at the predicted target position and fire when ready.
-            Vector3 lead = m_TankSM.PredictTargetPoint();
-            m_TankSM.RotateTowards(lead - m_TankSM.transform.position);
+            m_TankSM.RotateTowards(m_TankSM.PredictTargetPoint() - m_TankSM.transform.position);
             m_TankSM.TryFire();
         }
     }

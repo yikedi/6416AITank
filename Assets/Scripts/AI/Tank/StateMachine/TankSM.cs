@@ -122,6 +122,29 @@ namespace CE6127.Tanks.AI
         private Vector3 m_PrevTargetForward;                        // Used to estimate the target's turn rate.
         private bool m_TargetTracked;                               // Whether target velocity tracking has started.
 
+        // Encirclement constants keep anti-kiting tuning in code without changing any prefab.
+        private const float RingStepDeg = 50f;
+        private const float InnerCutMargin = 6f;
+        private const float MinRingRadius = 6f;
+        private const float RingMoveHoldSeconds = 1.5f;
+        private const float SwitchHysteresisDeg = 15f;
+        private const float EncircleHandoffRange = 14f;
+        private const float AllyMinGap = 6f;
+        private const float FlankSpread = 8f;
+
+        /// <summary>How this tank closes the angular gap while the target is kiting.</summary>
+        public enum RingMove
+        {
+            CounterOrbit, // Travel against the target's rotation for a guaranteed head-on meeting.
+            InnerCut      // Travel with it on a smaller radius to gain angular speed.
+        }
+
+        private RingMove m_RingMove = RingMove.InnerCut;
+        private float m_RingMoveUntil = -1f;
+
+        /// <summary>Furthest horizontal distance a shell can still reach.</summary>
+        public float MaxFireRange => m_MaxFireRange;
+
         /// <summary>
         /// Method <c>MoveTurnSound</c> returns the current tank's velocity.
         /// </summary>
@@ -231,11 +254,13 @@ namespace CE6127.Tanks.AI
                 if (!HasTarget())
                     SelectTarget();
                 TickTargetTracking();
+                OrbitTracker.Tick(Target); // Shared tracker performs work only for the first tank each frame.
                 base.Update();
             }
             else
             {
                 m_Started = false;
+                OrbitTracker.Reset(); // Do not carry a previous round's path into the next round.
                 StopAllCoroutines();
             }
         }
@@ -588,6 +613,222 @@ namespace CE6127.Tanks.AI
             Vector3 direction = new Vector3(Mathf.Sin(phi), 0f, Mathf.Cos(phi));
             return Target.position + direction * OrbitRadius();
         }
+
+        // =====================================================================
+        // Encirclement — used while the target is kiting around an obstacle.
+        // Equal-speed pursuit collapses the platoon into a queue. Ring coordinates
+        // restore convergence through counter-rotation and inner-radius cutting.
+        // =====================================================================
+
+        /// <summary>Bearing of a world position around the fitted loop centre, in degrees.</summary>
+        public float RingAngle(Vector3 position)
+        {
+            Vector3 d = position - OrbitTracker.Pivot;
+            d.y = 0f;
+            return Mathf.Atan2(d.x, d.z) * Mathf.Rad2Deg;
+        }
+
+        /// <summary>Distance of a world position from the fitted loop centre.</summary>
+        public float RingRadius(Vector3 position)
+        {
+            Vector3 d = position - OrbitTracker.Pivot;
+            d.y = 0f;
+            return d.magnitude;
+        }
+
+        /// <summary>Clockwise/counter-clockwise lag behind the target around its loop.</summary>
+        public float LagAngleOf(Vector3 position)
+        {
+            float delta = (RingAngle(Target.position) - RingAngle(position)) * OrbitTracker.Sign;
+            return Mathf.Repeat(delta, 360f);
+        }
+
+        /// <summary>Convenience overload for this tank.</summary>
+        public float LagAngle() => LagAngleOf(transform.position);
+
+        /// <summary>
+        /// Chooses the faster ring-closing move and forces the furthest/closest tanks into
+        /// opposite roles. The hold and dead band prevent noisy role flip-flopping.
+        /// </summary>
+        public RingMove DecideRingMove()
+        {
+            if (Time.time < m_RingMoveUntil)
+                return m_RingMove;
+
+            float targetRadius = Mathf.Max(RingRadius(Target.position), MinRingRadius);
+            float innerRadius = Mathf.Max(MinRingRadius, targetRadius - InnerCutMargin);
+            float k = Mathf.Max(targetRadius / innerRadius, 1.05f);
+            float switchDeg = 180f * (k - 1f) / k;
+            float myLag = LagAngle();
+
+            // Rank every active tank by lag using the platoon's shared fitted pivot.
+            int rank = 0;
+            int alive = 0;
+            var tanks = GameManager.AIPlatoon.Tanks;
+            for (var i = 0; i < tanks.Count; ++i)
+            {
+                GameObject instance = tanks[i].Instance;
+                if (instance == null || !instance.activeSelf)
+                    continue;
+
+                ++alive;
+                if (instance == gameObject)
+                    continue;
+
+                float lag = LagAngleOf(instance.transform.position);
+                if (lag > myLag || (Mathf.Abs(lag - myLag) < 0.01f && i < m_PlatoonIndex))
+                    ++rank;
+            }
+
+            RingMove move;
+            if (alive >= 2 && rank == 0)
+                move = RingMove.CounterOrbit; // Furthest behind always reverses.
+            else if (alive >= 2 && rank == alive - 1)
+                move = RingMove.InnerCut; // Closest behind always cuts inside.
+            else if (myLag > switchDeg + SwitchHysteresisDeg)
+                move = RingMove.CounterOrbit;
+            else if (myLag < switchDeg - SwitchHysteresisDeg)
+                move = RingMove.InnerCut;
+            else
+                move = m_RingMove;
+
+            m_RingMove = move;
+            m_RingMoveUntil = Time.time + RingMoveHoldSeconds;
+            return move;
+        }
+
+        /// <summary>
+        /// Produces one short waypoint around the ring so NavMesh cannot silently choose the
+        /// opposite direction by taking the shortest route to a distant final bearing.
+        /// </summary>
+        public Vector3 RingDestination()
+        {
+            RingMove move = DecideRingMove();
+            float direction = move == RingMove.CounterOrbit ? -OrbitTracker.Sign : OrbitTracker.Sign;
+
+            float targetRadius = Mathf.Max(RingRadius(Target.position), MinRingRadius);
+            float wanted = move == RingMove.CounterOrbit
+                ? targetRadius
+                : Mathf.Max(MinRingRadius, targetRadius - InnerCutMargin);
+
+            float theta = (RingAngle(transform.position) + direction * RingStepDeg) * Mathf.Deg2Rad;
+            Vector3 bearing = new Vector3(Mathf.Sin(theta), 0f, Mathf.Cos(theta));
+
+            // Widen a waypoint that falls inside an obstacle until NavMesh accepts it.
+            for (var attempt = 0; attempt < 3; ++attempt)
+            {
+                Vector3 candidate = OrbitTracker.Pivot + bearing * (wanted + attempt * 3f);
+                candidate.y = transform.position.y;
+                if (NavMesh.SamplePosition(candidate, out NavMeshHit hit, 5f, NavMesh.AllAreas))
+                    return hit.position;
+            }
+
+            return Target.position;
+        }
+
+        /// <summary>Returns whether ring movement should still own the approach.</summary>
+        public bool ShouldEncircle()
+        {
+            if (!OrbitTracker.IsOrbiting || !HasTarget())
+                return false;
+            if (HasLineOfSightToTarget() && DistanceToTarget() <= EncircleHandoffRange)
+                return false;
+            return true;
+        }
+
+        /// <summary>Finds the earliest future target point this tank can reach in time.</summary>
+        public Vector3 InterceptPoint()
+        {
+            if (!HasTarget())
+                return transform.position;
+
+            Vector3 position = Target.position;
+            Vector3 velocity = TargetVelocity;
+            const float step = 0.25f;
+
+            for (var i = 1; i <= 20; ++i)
+            {
+                velocity = Quaternion.Euler(0f, TargetAngularVelocity * step, 0f) * velocity;
+                position += velocity * step;
+                if (Vector3.Distance(transform.position, position) / Mathf.Max(GameManager.Speed, 0.1f) <= i * step)
+                    return position;
+            }
+
+            return Target.position;
+        }
+
+        /// <summary>Spreads interception laterally relative to the target's velocity.</summary>
+        public Vector3 SpreadDestination()
+        {
+            Vector3 ahead = InterceptPoint();
+            Vector3 velocity = TargetVelocity;
+            velocity.y = 0f;
+            if (velocity.sqrMagnitude < 1f)
+                return ahead;
+
+            float side = AssignedRole == Role.LeftFlank ? -1f
+                       : AssignedRole == Role.RightFlank ? 1f
+                       : 0f;
+            Vector3 lateral = Vector3.Cross(Vector3.up, velocity.normalized);
+            Vector3 candidate = ahead + lateral * (side * FlankSpread);
+
+            return NavMesh.SamplePosition(candidate, out NavMeshHit hit, 5f, NavMesh.AllAreas)
+                ? hit.position
+                : ahead;
+        }
+
+        /// <summary>Pushes a destination outside the player's shared blast radius of allies.</summary>
+        public Vector3 SeparateFromAllies(Vector3 destination)
+        {
+            var tanks = GameManager.AIPlatoon.Tanks;
+            for (var i = 0; i < tanks.Count; ++i)
+            {
+                GameObject instance = tanks[i].Instance;
+                if (instance == null || instance == gameObject || !instance.activeSelf)
+                    continue;
+
+                Vector3 offset = destination - instance.transform.position;
+                offset.y = 0f;
+                float gap = offset.magnitude;
+                if (gap < AllyMinGap && gap > 0.01f)
+                    destination = instance.transform.position + offset / gap * AllyMinGap;
+            }
+
+            return NavMesh.SamplePosition(destination, out NavMeshHit hit, 4f, NavMesh.AllAreas)
+                ? hit.position
+                : destination;
+        }
+
+        /// <summary>Returns the destination for the current pursuit/engagement regime.</summary>
+        public Vector3 MovementDestination(bool engaging)
+        {
+            Vector3 destination = ShouldEncircle() ? RingDestination()
+                                : engaging ? OrbitPoint()
+                                : SpreadDestination();
+            return SeparateFromAllies(destination);
+        }
+
+#if UNITY_EDITOR
+        /// <summary>Draws the fitted ring, current waypoint, and assigned ring role.</summary>
+        private void OnDrawGizmos()
+        {
+            if (!Application.isPlaying || !OrbitTracker.IsOrbiting || Target == null)
+                return;
+
+            Gizmos.color = Color.cyan;
+            Gizmos.DrawWireSphere(OrbitTracker.Pivot, 1f);
+            UnityEditor.Handles.color = Color.cyan;
+            UnityEditor.Handles.DrawWireDisc(OrbitTracker.Pivot, Vector3.up, OrbitTracker.Radius);
+
+            bool counter = m_RingMove == RingMove.CounterOrbit;
+            Gizmos.color = counter ? Color.magenta : Color.yellow;
+            Gizmos.DrawLine(transform.position + Vector3.up, NavMeshAgent.destination + Vector3.up);
+            Gizmos.DrawWireCube(NavMeshAgent.destination + Vector3.up, Vector3.one * 0.8f);
+
+            UnityEditor.Handles.Label(transform.position + Vector3.up * 3f,
+                $"{(counter ? "REVERSE" : "INNER")}  lag={LagAngle():F0}");
+        }
+#endif
 
         /// <summary>
         /// Method <c>TryFire</c> fires a shell when the target is in range, visible, and within the aim tolerance.
