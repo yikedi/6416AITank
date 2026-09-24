@@ -79,8 +79,10 @@ namespace CE6127.Tanks.AI
         public float MinFireRange = 0f;                             // Below this distance the AI holds fire (0 = never hold).
         [Tooltip("Base distance the AI tries to keep from the target while engaging.")]
         public float EngageRadius = 8f;                             // How close the AI tries to get while attacking.
-        [Tooltip("Maximum aim offset (degrees) tolerated before firing.")]
+        [Tooltip("Maximum aim offset (degrees) tolerated before firing, inside 8 m.")]
         public float AimToleranceDeg = 3.5f;                        // How accurately the hull must face the target before firing.
+        [Tooltip("Maximum lateral miss (metres) tolerated before firing, beyond 8 m. Converted to an angle at the target's range, so the permitted miss does not grow with distance.")]
+        public float AimLateralTolerance = 0.5f;                    // Permitted lateral miss beyond 8 m.
         [Tooltip("How fast the AI orbits the target (degrees per second).")]
         public float OrbitAngularSpeed = 25f;                       // How quickly the AI circles the target while attacking.
         [Tooltip("Radius multiplier applied to flankers so they keep their distance.")]
@@ -99,7 +101,7 @@ namespace CE6127.Tanks.AI
         public Vector2 FireInterval = new(0.7f, 2.5f);              // A minimum and maximum cooldown time delay between each firing.
         [Tooltip("Force given to the shell if the fire button is not held, and the force given to the shell if the fire button is held for the max charge time in seconds.")]
         public Vector2 LaunchForceMinMax = new(6.5f, 30f);          // The force given to the shell if the fire button is not held, and the force given to the shell if the fire button is held for the max charge time.
-        [Tooltip("Height at which the shell crosses the target's plane, as a fraction of the launch height. 1 = skims the tank top at barrel height (tends to fly over), 0.7 = drops onto the hull, 0 = lands on the ground.")]
+        [Tooltip("Height at which the shell crosses the target's plane, as a fraction of the launch height. 1 = exactly the top face of the tank collider, so only the shell radius is left as margin and any lead error flies over; 0.7 = drops onto the hull; 0 = lands on the ground.")]
         [Range(0f, 1f)] public float PassHeightFactor = 1.0f;       // Intercept height for MaxForceWithoutOvershoot as a fraction of m_LaunchHeight.
 
         [Header("References")]
@@ -491,9 +493,16 @@ namespace CE6127.Tanks.AI
         /// Method <c>PredictTargetPoint</c> returns the world position to aim at.
         /// <para>
         /// The target's future positions are sampled along its curved path (current linear and
-        /// angular velocity) over the next 1.5s at 0.1s steps. Each sample is scored by whether
-        /// the shell can arrive exactly when the target does: <c>rotateTime + flightTime ≈ t</c>.
-        /// The earliest sample that can be hit on time wins; the closest match is the fallback.
+        /// angular velocity) over the next 1.5s. Each sample is scored by its signed timing error
+        /// <c>f = rotateTime + flightTime − t</c>: positive means the shell would arrive after the
+        /// target has passed that point. The bracketing pair where <c>f</c> changes sign is
+        /// interpolated to the exact crossing, which is both more accurate than the nearest sample
+        /// and unbiased — stopping at the first "close enough" sample would always stop on the
+        /// late side, because <c>f</c> decreases through zero, and aim consistently short.
+        /// </para>
+        /// <para>
+        /// With no sign change inside the horizon the target cannot be intercepted in time and the
+        /// sample with the smallest timing error is returned instead.
         /// </para>
         /// </summary>
         public Vector3 PredictTargetPoint()
@@ -501,11 +510,10 @@ namespace CE6127.Tanks.AI
             if (!HasTarget())
                 return transform.position + transform.forward * 10f;
 
-            const float horizon = 1.5f;             // Seconds of future path considered; beyond this a shot would fall short anyway.
+            const float horizon = 1.5f;             // Seconds of future path considered; sized to the longest flight time (~1.32s at MaxFireRange).
             const int sampleCount = 40;             // Number of future-path samples over the horizon.
             const float step = horizon / sampleCount;
             const float rotSpeed = 180f;            // NavMeshAgent.angularSpeed (deg/s).
-            const float timingTolerance = 0.05f;    // ~0.4m of travel at 8 m/s.
 
             Vector3 forward = FireTransform.forward;
             forward.y = 0f;
@@ -519,6 +527,11 @@ namespace CE6127.Tanks.AI
 
             Vector3 bestAim = Target.position;
             float bestDiff = float.MaxValue;
+
+            // Previous sample, kept so the sign change in f can be bracketed.
+            Vector3 prevPos = pos;
+            float prevF = 0f;
+            bool hasPrev = false;
 
             for (int i = 1; i <= sampleCount; ++i)
             {
@@ -535,19 +548,35 @@ namespace CE6127.Tanks.AI
 
                 float rotateTime = Vector3.Angle(forward, delta) / rotSpeed;
                 float flightTime = FlightTime(d);
-                float diff = Mathf.Abs(rotateTime + flightTime - t);
 
+                // Signed, not absolute: positive means the shell arrives after the target has
+                // passed this point. The sign matters because the shell only drops to the hull at
+                // the aim point — an aim that is even slightly short keeps it above the tank.
+                float f = rotateTime + flightTime - t;
+
+                // f crossed zero between the previous sample and this one, so the true intercept
+                // lies in between. Interpolating it is free and far more accurate than taking
+                // whichever of the two samples happened to be nearer.
+                if (hasPrev && (prevF > 0f) != (f > 0f))
+                {
+                    float frac = prevF / (prevF - f);
+                    return Vector3.Lerp(prevPos, pos, frac);
+                }
+
+                float diff = Mathf.Abs(f);
                 if (diff < bestDiff)
                 {
                     bestDiff = diff;
                     bestAim = pos;
                 }
 
-                // Earliest sample that can be hit on time.
-                if (diff <= timingTolerance)
-                    return pos;
+                prevPos = pos;
+                prevF = f;
+                hasPrev = true;
             }
 
+            // No sign change: the target cannot be reached in time, so fall back to the sample
+            // whose timing was closest. MaxFireRange rejects most of these before they are fired.
             return bestAim;
         }
 
@@ -878,13 +907,22 @@ namespace CE6127.Tanks.AI
             Vector3 forward = FireTransform.forward;
             forward.y = 0f;
 
-            // Aim tolerance scales with distance. Below ~5m the shell's body makes a modest
-            // misalignment still connect, so widen by an extra 30%; above ~8m tighten for
-            // accuracy. Both blend smoothly over the transition band in between.
-            float rangeFactor = Mathf.Clamp(8f / Mathf.Max(aimDistance, 0.5f), 1f, 6f);
-            float precisionFactor = Mathf.Lerp(1f, 0.7f, Mathf.InverseLerp(8f, 14f, aimDistance));
-            float closeFactor = Mathf.Lerp(1.3f, 1f, Mathf.InverseLerp(5f, 8f, aimDistance));
-            float tolerance = AimToleranceDeg * rangeFactor * precisionFactor * closeFactor;
+            // Below NearRange the original angular allowance is kept. Its own 8/d scaling already
+            // holds the permitted lateral error near AimLateralTolerance, and a tighter angle
+            // this close would only cost shots; the 1.3 close factor lets the shell's own body
+            // connect a modest misalignment.
+            //
+            // Beyond NearRange the allowance is converted to an angle at the target's range, so
+            // the permitted miss distance stops growing with distance. At a fixed angle the
+            // lateral error grows linearly — 0.86 m at 20 m, 1.28 m at 30 m — and passes the
+            // tank's ~0.9 m half-width around 22 m, which is what let long shots land behind.
+            const float NearRange = 8f;
+            float rangeFactor = Mathf.Clamp(NearRange / Mathf.Max(aimDistance, 0.5f), 1f, 6f);
+            float closeFactor = Mathf.Lerp(1.3f, 1f, Mathf.InverseLerp(5f, NearRange, aimDistance));
+
+            float tolerance = aimDistance <= NearRange
+                ? AimToleranceDeg * rangeFactor * closeFactor
+                : Mathf.Atan2(AimLateralTolerance, aimDistance) * Mathf.Rad2Deg;
             if (Vector3.Angle(forward, aim) > tolerance)
                 return false;
 
