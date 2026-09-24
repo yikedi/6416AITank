@@ -211,7 +211,7 @@ The tolerance is **piecewise**, and it is deliberately loose at short range — 
 
 ```
 d ≤ 8 m : tolerance = AimToleranceDeg(3.5°) × close-range widening (up to 6×)
-d > 8 m : tolerance = atan(AimLateralTolerance(0.5 m) / d)      ← fixed lateral allowance
+d > 8 m : tolerance = atan(AimLateralTolerance(0.75 m) / d)     ← fixed lateral allowance
 ```
 
 **Three reasons for loosening at close range:**
@@ -222,14 +222,16 @@ d > 8 m : tolerance = atan(AimLateralTolerance(0.5 m) / d)      ← fixed latera
 
 3. **Suppression and movement denial.** Since precise single shots are not worth it up close, **maintaining fire coverage** is the better play: continuous fire pressures the player and **compresses the space available to them** — every dodge forces a direction change, and those directions are exactly what the two flankers are blocking. **Driving the player into the encirclement with fire** serves the platoon objective better than chasing a single guaranteed hit.
 
-**At long range the tolerance must tighten**, because lateral error is `distance × tan(angle)` and therefore grows linearly. The old **constant angle** (2.45°) exceeded the tank's effective collider radius (about 0.9 m) at roughly 22 m — **past 22 m the tolerance alone permitted a miss**. Switching to a fixed lateral allowance of 0.5 m gives:
+**At long range the tolerance must tighten**, because lateral error is `distance × tan(angle)` and therefore grows linearly. The old **constant angle** (2.45°) exceeded the tank's effective collider radius (about 0.9 m) at roughly 22 m — **past 22 m the tolerance alone permitted a miss**. Switching to a fixed lateral allowance gives:
 
-| Range | Lateral error (old) | Lateral error (new) |
-|---|---|---|
-| 8 m | 0.49 m | 0.49 m (unchanged) |
-| 20 m | 0.86 m | **0.50 m** |
-| 30 m | 1.28 m | **0.50 m** |
-| 39 m | 1.67 m | **0.50 m** |
+| Range | Lateral error (old) | Lateral error (new) | Tolerance (new) |
+|---|---|---|---|
+| 8 m | 0.49 m | 0.49 m (unchanged) | 3.50° |
+| 20 m | 0.86 m | **0.75 m** | 2.15° |
+| 30 m | 1.28 m | **0.75 m** | 1.43° |
+| 39 m | 1.67 m | **0.75 m** | 1.10° |
+
+**Why the allowance is 0.75 m rather than tighter.** The tighter the tolerance, the longer the hull must wait to be aligned before it may fire — so the rate of fire falls. At 0.5 m the drop in fire rate was clearly visible in play. At 0.75 m the allowance is still inside the tank's effective collider radius of about 0.9 m, so **the long-range accuracy fix stands while the firing window widens by 1.5×**. It is a measured balance between shooting accurately and shooting often.
 
 > **Why the inside-8 m region is left alone**: the existing `8/d` scaling there **already implements the fixed-lateral-allowance idea** (lateral error stays between 0.49 m and 0.64 m). The new code extends that **existing idea** past 8 m rather than inventing a different one.
 
@@ -345,9 +347,9 @@ The strongest result: six consecutive matches, each winning all three rounds —
 4. **Traceable trade-offs.** The 72° threshold, the 1.25× flanker radius and the 35% health line are all derived or measured, not magic numbers.
 5. **Clean compliance.** Every change sits in `Assets/Scripts/AI/**`; prefabs, scenes and `ProjectSettings` are unchanged from the baseline.
 
-## 4.3 Two defects fixed this round
+## 4.3 Three defects fixed this round
 
-Both are of the **"correct model, biased implementation"** kind — the ballistic formula and the flight-time formula were both right; the error was in how they were applied.
+All three are of the **"correct model, biased implementation"** kind — the ballistic formula, the flight-time formula and the low-pass filter were each right in themselves; the error was in how they were applied.
 
 ### Defect 1: the lead was systematically short
 
@@ -359,7 +361,25 @@ Fix: run the loop to completion, track the minimum `|f|`, and **interpolate** be
 
 ### Defect 2: the tolerance was a constant angle
 
-See §2.5. Lateral error grows linearly with range and exceeded the effective collider radius (0.9 m) at about 22 m — **past 22 m the tolerance alone permitted a miss**, which is the direct source of shells landing behind the player. After switching to a fixed lateral allowance, the error at 39 m falls from 1.67 m to 0.50 m (a 3.3× tightening).
+See §2.5. Lateral error grows linearly with range and exceeded the effective collider radius (0.9 m) at about 22 m — **past 22 m the tolerance alone permitted a miss**, which is the direct source of shells landing behind the player. After switching to a fixed lateral allowance, the error at 39 m falls from 1.67 m to 0.75 m.
+
+> The allowance sits at 0.75 m rather than tighter because a tighter tolerance lowers the rate of fire; at 0.5 m the drop was clearly visible in play.
+
+### Defect 3: the velocity estimate's responsiveness was measured in frames, not seconds
+
+Lead prediction needs the player's velocity. `TickTargetTracking()` estimates it by differencing consecutive frames and then low-pass filters it. The filter factor was written as **"advance 40% every frame"** — so its **time constant was measured in frames, not seconds**:
+
+| Frame rate | Time constant |
+|---|---|
+| 200 fps | ~10 ms |
+| 60 fps | 32.6 ms |
+| 30 fps | ~65 ms |
+
+The same filter left the velocity estimate **six times more sluggish** at a low frame rate. And since **lead = velocity × flight time**, a lagging velocity estimate is a wrong lead.
+
+**This is the direct cause of the AI being noticeably stronger in the Editor and noticeably weaker in the standalone build.** The causation was confirmed by measurement: shrinking the build's window to raise its frame rate immediately restored the AI's strength.
+
+Fix: the filter factor is now delta-time compensated, so its time constant is the same at **every** frame rate. The value was then set by measurement — **less smoothing proved more accurate**, meaning lag hurts more than noise in this scenario.
 
 ### A hypothesis the measurements disproved (recorded honestly)
 
@@ -373,7 +393,8 @@ So the extra 0.9 m of margin that 0.7 buys is **never used**, while it costs a *
 
 Ordered by magnitude of impact:
 
-- 🔴 **The prediction assumes the player holds their current linear and angular velocity.** When the player accelerates, decelerates or changes turn direction, the prediction is off by up to **metres** — far beyond the 0.1–0.5 m corrections above. **This is the dominant remaining source of uncertainty in our hit rate.**
+- 🔴 **The velocity difference is aliased.** The player's position is advanced by the physics engine at **50 Hz** (`Rigidbody.MovePosition` in `FixedUpdate`) and is **not interpolated for rendering** (`m_Interpolate: 0`), while the AI samples it at the **render** rate. Each frame's displacement is therefore a whole number of physics steps, but the code divides it by a **render frame time** — a **unit mismatch**. At 60 fps the resulting speed reads 14.4 m/s where the true value is 12, and drops to zero on frames that contain no physics step. **The low-pass filter is currently papering over this bad input.** Located but **not yet fixed**; the fix is to sample on the physics step and drop the filter entirely. **The magnitude of this one is not yet measured.**
+- 🔴 **The prediction assumes the player holds their current linear and angular velocity.** When the player accelerates, decelerates or changes turn direction, the prediction is off by up to **metres** — far beyond the 0.1–0.75 m corrections above. This and the item above are the joint dominant remaining sources of uncertainty in our hit rate.
 - 🟡 **Physical ramming and self-damage.** Both interception and counter-orbiting aim for head-on meetings, and ally spacing only constrains AI-versus-AI distances. With `MinFireRange = 0`, point-blank fire takes splash damage from the AI's own shell (a deliberate trade-off).
 - 🟡 **God's-eye perception.** The AI reads the player's position and velocity directly, with no field of view, occlusion or range limit. Line of sight is still checked before firing, so it cannot shoot through walls — but strictly speaking the AI is aware of a target it cannot see.
 - 🟢 **`AcquireRange` is a dead field**, read nowhere in the project; `SelectTarget()` picks the nearest target unconditionally.
@@ -397,12 +418,13 @@ In other words, **this design is optimised for one specific constraint: that the
 
 ## 4.6 Improvements
 
-1. **Remove the constant-velocity assumption** (highest value). Options: handle player turns conservatively (rather than risk a wild shot, hold fire), shorten the effective prediction window, or bound the error introduced by turning.
-2. **Limited perception.** Gate `SelectTarget()` on a field of view or range instead of the current god's-eye model. The assignment does not forbid omniscience, but explicitly modelling perception is a genuine AI-quality improvement.
-3. **Survival coordination** (if the precondition above relaxes). Alternating cover, bounding advance, damaged tanks disengaging.
-4. **Recompute the barrel elevation at runtime**, removing the model desynchronisation caused by hull pitch.
-5. **Remove the dead `AcquireRange` field.**
-6. **Collect post-fix test data** (necessary) — all existing data predates the fix commit.
+1. **Remove the aliasing in the velocity difference** (see the first item of §4.4). Sample on the physics step and divide by `Time.fixedDeltaTime`, so the input is correct first; the smoothing filter can then be deleted outright — one change removing the aliasing, the lag and the filter together. **This is the highest-value item.**
+2. **Remove the constant-velocity assumption.** Options: handle player turns conservatively (rather than risk a wild shot, hold fire), shorten the effective prediction window, or bound the error introduced by turning.
+3. **Limited perception.** Gate `SelectTarget()` on a field of view or range instead of the current god's-eye model. The assignment does not forbid omniscience, but explicitly modelling perception is a genuine AI-quality improvement.
+4. **Survival coordination** (if the precondition above relaxes). Alternating cover, bounding advance, damaged tanks disengaging.
+5. **Recompute the barrel elevation at runtime**, removing the model desynchronisation caused by hull pitch.
+6. **Remove the dead `AcquireRange` field.**
+7. **Collect post-fix test data** (necessary) — all existing data predates the fix commit.
 
 ---
 
@@ -435,7 +457,8 @@ In other words, **this design is optimised for one specific constraint: that the
 | Role hold time / dead band | 1.5 s / ±15° |
 | Engagement radius | 8 m (pusher) / 10 m (flanker) |
 | Damaged retreat | HP < 35% → radius ×1.4 |
-| Aim tolerance | ≤ 8 m: 3.5°; > 8 m: 0.5 m lateral |
+| Aim tolerance | ≤ 8 m: 3.5°; > 8 m: 0.75 m lateral (inside the ~0.9 m effective collider radius) |
+| Velocity smoothing time constant | 8.2 ms (frame-rate independent; set by `VelocitySmoothingReferenceFps` = 240) |
 | Intercept-height factor | 1.0 |
 
 # Appendix C: Supporting documents
