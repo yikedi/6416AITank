@@ -82,7 +82,7 @@ namespace CE6127.Tanks.AI
         [Tooltip("Maximum aim offset (degrees) tolerated before firing, inside 8 m.")]
         public float AimToleranceDeg = 3.5f;                        // How accurately the hull must face the target before firing.
         [Tooltip("Maximum lateral miss (metres) tolerated before firing, beyond 8 m. Converted to an angle at the target's range, so the permitted miss does not grow with distance.")]
-        public float AimLateralTolerance = 0.5f;                    // Permitted lateral miss beyond 8 m.
+        public float AimLateralTolerance = 0.75f;                   // Permitted lateral miss beyond 8 m. Keep below the ~0.9 m effective collider radius.
         [Tooltip("How fast the AI orbits the target (degrees per second).")]
         public float OrbitAngularSpeed = 25f;                       // How quickly the AI circles the target while attacking.
         [Tooltip("Radius multiplier applied to flankers so they keep their distance.")]
@@ -123,6 +123,17 @@ namespace CE6127.Tanks.AI
         private Vector3 m_PrevTargetPosition;                       // Used to estimate the target's velocity.
         private Vector3 m_PrevTargetForward;                        // Used to estimate the target's turn rate.
         private bool m_TargetTracked;                               // Whether target velocity tracking has started.
+
+        // The velocity smoothing below was originally this Lerp factor applied once per frame,
+        // which made its time constant depend on the frame rate: about 10 ms at 200 fps but 65 ms
+        // at 30 fps. That measurably weakened the AI in a standalone build running slower than the
+        // Editor. The factor is now delta-time compensated against a reference frame rate, so the
+        // smoothing behaves identically at every frame rate and the reference alone sets how
+        // responsive it is.
+        private const float VelocitySmoothingFactor = 0.4f;
+
+        [Tooltip("Frame rate whose per-frame smoothing behaviour is reproduced at every frame rate. Higher tracks the target's velocity more closely (less lead lag) but admits more noise from the frame-to-frame difference.")]
+        public float VelocitySmoothingReferenceFps = 240f;          // Time constant = -1 / (refFps · ln(1 - VelocitySmoothingFactor)): 32.6 ms at 60, 16.3 ms at 120, 8.2 ms at 240.
 
         // Encirclement constants keep anti-kiting tuning in code without changing any prefab.
         // They are const rather than public fields so nothing new is serialised into the prefab,
@@ -381,15 +392,19 @@ namespace CE6127.Tanks.AI
                 return;
             }
 
+            // Delta-time-compensated smoothing factor: the filter behaves as VelocitySmoothingFactor
+            // per frame at the reference frame rate, and identically at every other frame rate.
+            float smoothing = 1f - Mathf.Pow(1f - VelocitySmoothingFactor, Time.deltaTime * VelocitySmoothingReferenceFps);
+
             // Linear velocity: frame-differenced position, smoothed.
             Vector3 instant = (Target.position - m_PrevTargetPosition) / Mathf.Max(Time.deltaTime, 1e-4f);
-            TargetVelocity = Vector3.Lerp(TargetVelocity, instant, 0.4f);
+            TargetVelocity = Vector3.Lerp(TargetVelocity, instant, smoothing);
             m_PrevTargetPosition = Target.position;
 
             // Angular velocity: signed angle between consecutive forward directions (deg/s).
             float angleDeg = Vector3.SignedAngle(m_PrevTargetForward, forward, Vector3.up);
             float instantAngular = angleDeg / Mathf.Max(Time.deltaTime, 1e-4f);
-            TargetAngularVelocity = Mathf.Clamp(Mathf.Lerp(TargetAngularVelocity, instantAngular, 0.4f), -180f, 180f);
+            TargetAngularVelocity = Mathf.Clamp(Mathf.Lerp(TargetAngularVelocity, instantAngular, smoothing), -180f, 180f);
             m_PrevTargetForward = forward;
         }
 
