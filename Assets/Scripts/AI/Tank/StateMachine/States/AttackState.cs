@@ -47,8 +47,9 @@ namespace CE6127.Tanks.AI
             if (m_TankSM.HasLineOfSightToTarget())
                 m_LastLosTime = Time.time;
 
-            // Match Chase's wider entry gate. The grace period prevents state ping-pong when
-            // the player briefly flickers behind a rock.
+            // Chase enters Attack at 0.8 x range, so only leaving at 0.95 x range leaves a wide
+            // hysteresis band and the two states cannot ping-pong at the boundary. The 0.75s
+            // grace covers the player briefly ducking behind a rock without losing the engagement.
             if (distance > m_TankSM.MaxFireRange * 0.95f || Time.time - m_LastLosTime > 0.75f)
             {
                 m_StateMachine.ChangeState(m_TankSM.m_States.Chase);

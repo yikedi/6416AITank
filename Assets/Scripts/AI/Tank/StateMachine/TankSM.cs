@@ -123,14 +123,16 @@ namespace CE6127.Tanks.AI
         private bool m_TargetTracked;                               // Whether target velocity tracking has started.
 
         // Encirclement constants keep anti-kiting tuning in code without changing any prefab.
-        private const float RingStepDeg = 50f;
-        private const float InnerCutMargin = 6f;
-        private const float MinRingRadius = 6f;
-        private const float RingMoveHoldSeconds = 1.5f;
-        private const float SwitchHysteresisDeg = 15f;
-        private const float EncircleHandoffRange = 14f;
-        private const float AllyMinGap = 6f;
-        private const float FlankSpread = 8f;
+        // They are const rather than public fields so nothing new is serialised into the prefab,
+        // where the assignment's fixed values live.
+        private const float RingStepDeg = 50f;          // Bearing spanned by one ring waypoint; short enough that NavMesh cannot cut across the ring.
+        private const float InnerCutMargin = 6f;        // An inner cut runs at R_target - this margin, which is what buys the extra angular speed.
+        private const float MinRingRadius = 6f;         // Floor on the loop radius so a small fitted circle cannot demand an impossible turn.
+        private const float RingMoveHoldSeconds = 1.5f; // A chosen ring move is committed for this long before it may be re-evaluated.
+        private const float SwitchHysteresisDeg = 15f;  // Dead band either side of the switch angle, so the move cannot flip every frame.
+        private const float EncircleHandoffRange = 14f; // With line of sight this close, ring movement hands over to normal orbiting.
+        private const float AllyMinGap = 6f;            // Minimum spacing kept between allies so the platoon does not stack into one line.
+        private const float FlankSpread = 8f;           // Lateral offset of a flanker's interception point from the target's own track.
 
         /// <summary>How this tank closes the angular gap while the target is kiting.</summary>
         public enum RingMove
@@ -139,8 +141,8 @@ namespace CE6127.Tanks.AI
             InnerCut      // Travel with it on a smaller radius to gain angular speed.
         }
 
-        private RingMove m_RingMove = RingMove.InnerCut;
-        private float m_RingMoveUntil = -1f;
+        private RingMove m_RingMove = RingMove.InnerCut; // Ring move currently committed to.
+        private float m_RingMoveUntil = -1f;             // Time the committed move may next be re-evaluated.
 
         /// <summary>Furthest horizontal distance a shell can still reach.</summary>
         public float MaxFireRange => m_MaxFireRange;
@@ -286,7 +288,12 @@ namespace CE6127.Tanks.AI
             if (m_PlatoonIndex < 0)
                 m_PlatoonIndex = 0;
 
+            // Roles are dealt out round-robin by platoon index, so a three-tank platoon always
+            // fields one pusher and one flanker per side no matter what order it spawned in.
             AssignedRole = (Role)(m_PlatoonIndex % 3);
+
+            // The left flanker orbits clockwise and everyone else counter-clockwise, which sends
+            // the two flankers around the target from opposite sides instead of in a queue.
             StrafeSign = AssignedRole == Role.LeftFlank ? -1 : 1;
         }
 
@@ -494,7 +501,7 @@ namespace CE6127.Tanks.AI
             if (!HasTarget())
                 return transform.position + transform.forward * 10f;
 
-            const float horizon = 1.5f;
+            const float horizon = 1.5f;             // Seconds of future path considered; beyond this a shot would fall short anyway.
             const int sampleCount = 40;             // Number of future-path samples over the horizon.
             const float step = horizon / sampleCount;
             const float rotSpeed = 180f;            // NavMeshAgent.angularSpeed (deg/s).
@@ -569,7 +576,11 @@ namespace CE6127.Tanks.AI
         public float OrbitRadius()
         {
             float roleMultiplier = AssignedRole == Role.Pusher ? 1f : FlankRadiusMultiplier;
+
+            // Below 35% health the tank hangs back at 140% of its usual radius. Every AI lost
+            // hands the player a point, so preserving platoon numbers outranks closing the range.
             float healthMultiplier = HealthFraction() < 0.35f ? 1.4f : 1f;
+
             return EngageRadius * roleMultiplier * healthMultiplier;
         }
 
@@ -655,9 +666,14 @@ namespace CE6127.Tanks.AI
             if (Time.time < m_RingMoveUntil)
                 return m_RingMove;
 
+            // Both sides travel at the same linear speed, and omega = v / R, so cutting inside
+            // gains angular speed in proportion to the ratio of radii, k = R_target / R_inner.
             float targetRadius = Mathf.Max(RingRadius(Target.position), MinRingRadius);
             float innerRadius = Mathf.Max(MinRingRadius, targetRadius - InnerCutMargin);
             float k = Mathf.Max(targetRadius / innerRadius, 1.05f);
+
+            // Lag at which cutting inside and reversing close the gap in equal time:
+            //   d / ((k-1)*omega) = (360-d) / ((1+k)*omega)  =>  d = 180 * (k-1) / k.
             float switchDeg = 180f * (k - 1f) / k;
             float myLag = LagAngle();
 
@@ -744,6 +760,9 @@ namespace CE6127.Tanks.AI
 
             Vector3 position = Target.position;
             Vector3 velocity = TargetVelocity;
+
+            // Walk the target's curved path forward in 0.25s steps (5s of horizon) and take the
+            // first point this tank can drive to no later than the target arrives there.
             const float step = 0.25f;
 
             for (var i = 1; i <= 20; ++i)
@@ -777,7 +796,11 @@ namespace CE6127.Tanks.AI
                 : ahead;
         }
 
-        /// <summary>Pushes a destination outside the player's shared blast radius of allies.</summary>
+        /// <summary>
+        /// Pushes a destination away from any ally that is closer than <see cref="AllyMinGap"/>.
+        /// This keeps the platoon spread out rather than queued, which both reduces how many
+        /// tanks a single blast can catch and stops allies from blocking each other's line of fire.
+        /// </summary>
         public Vector3 SeparateFromAllies(Vector3 destination)
         {
             var tanks = GameManager.AIPlatoon.Tanks;

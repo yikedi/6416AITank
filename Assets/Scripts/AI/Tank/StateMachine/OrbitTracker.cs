@@ -29,6 +29,8 @@ namespace CE6127.Tanks.AI
         private const float MaxRadius = 45f;
         private const float StaleSeconds = 0.5f;
 
+        // Shared state. s_Frame gates the update to once per frame; the rest is the path history
+        // and the estimate fitted from it.
         private static Transform s_Target;
         private static int s_Frame = -1;
         private static float s_LastTickTime = -99f;
