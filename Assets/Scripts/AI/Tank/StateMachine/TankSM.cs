@@ -124,16 +124,13 @@ namespace CE6127.Tanks.AI
         private Vector3 m_PrevTargetForward;                        // Used to estimate the target's turn rate.
         private bool m_TargetTracked;                               // Whether target velocity tracking has started.
 
-        // The velocity smoothing below was originally this Lerp factor applied once per frame,
-        // which made its time constant depend on the frame rate: about 10 ms at 200 fps but 65 ms
-        // at 30 fps. That measurably weakened the AI in a standalone build running slower than the
-        // Editor. The factor is now delta-time compensated against a reference frame rate, so the
-        // smoothing behaves identically at every frame rate and the reference alone sets how
-        // responsive it is.
-        private const float VelocitySmoothingFactor = 0.4f;
-
-        [Tooltip("Frame rate whose per-frame smoothing behaviour is reproduced at every frame rate. Higher tracks the target's velocity more closely (less lead lag) but admits more noise from the frame-to-frame difference.")]
-        public float VelocitySmoothingReferenceFps = 240f;          // Time constant = -1 / (refFps · ln(1 - VelocitySmoothingFactor)): 32.6 ms at 60, 16.3 ms at 120, 8.2 ms at 240.
+        // Time.fixedTimeAsDouble at the last velocity sample. The target's pose only changes on a
+        // physics step, so sampling is gated on it and the elapsed physics time comes from the
+        // difference between this and Time.fixedTimeAsDouble — never from a render frame time.
+        // Kept as a double because the difference is a single 0.02 s step: subtracting two floats
+        // that are already hundreds of seconds into the game would cost more precision than the
+        // measurement is worth.
+        private double m_LastFixedTime;
 
         // Encirclement constants keep anti-kiting tuning in code without changing any prefab.
         // They are const rather than public fields so nothing new is serialised into the prefab,
@@ -386,26 +383,31 @@ namespace CE6127.Tanks.AI
             {
                 m_PrevTargetPosition = Target.position;
                 m_PrevTargetForward = forward;
+                m_LastFixedTime = Time.fixedTimeAsDouble;
                 TargetVelocity = Vector3.zero;
                 TargetAngularVelocity = 0f;
                 m_TargetTracked = true;
                 return;
             }
 
-            // Delta-time-compensated smoothing factor: the filter behaves as VelocitySmoothingFactor
-            // per frame at the reference frame rate, and identically at every other frame rate.
-            float smoothing = 1f - Mathf.Pow(1f - VelocitySmoothingFactor, Time.deltaTime * VelocitySmoothingReferenceFps);
+            // Sample only when the physics step has actually advanced. Between steps the pose has not
+            // changed, so a per-frame difference reads zero; across several steps it holds a whole
+            // number of steps' worth of movement while being divided by a render frame time. Both
+            // are the same unit mismatch, and both disappear if we simply do not sample between steps.
+            float elapsed = (float)(Time.fixedTimeAsDouble - m_LastFixedTime);
+            if (elapsed <= 0f)
+                return;
 
-            // Linear velocity: frame-differenced position, smoothed.
-            Vector3 instant = (Target.position - m_PrevTargetPosition) / Mathf.Max(Time.deltaTime, 1e-4f);
-            TargetVelocity = Vector3.Lerp(TargetVelocity, instant, smoothing);
+            // Exact, with no filter needed: one physics step's displacement over one physics step's time.
+            TargetVelocity = (Target.position - m_PrevTargetPosition) / elapsed;
+
+            // Angular velocity: the angle swept over the same physics interval (deg/s).
+            TargetAngularVelocity = Mathf.Clamp(
+                Vector3.SignedAngle(m_PrevTargetForward, forward, Vector3.up) / elapsed, -180f, 180f);
+
             m_PrevTargetPosition = Target.position;
-
-            // Angular velocity: signed angle between consecutive forward directions (deg/s).
-            float angleDeg = Vector3.SignedAngle(m_PrevTargetForward, forward, Vector3.up);
-            float instantAngular = angleDeg / Mathf.Max(Time.deltaTime, 1e-4f);
-            TargetAngularVelocity = Mathf.Clamp(Mathf.Lerp(TargetAngularVelocity, instantAngular, smoothing), -180f, 180f);
             m_PrevTargetForward = forward;
+            m_LastFixedTime = Time.fixedTimeAsDouble;
         }
 
         /// <summary>
