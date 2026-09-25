@@ -365,9 +365,13 @@ See §2.5. Lateral error grows linearly with range and exceeded the effective co
 
 > The allowance sits at 0.75 m rather than tighter because a tighter tolerance lowers the rate of fire; at 0.5 m the drop was clearly visible in play.
 
-### Defect 3: the velocity estimate's responsiveness was measured in frames, not seconds
+### Defect 3: the velocity estimate was corrupted twice over — by the frame rate, and by the sampling itself
 
-Lead prediction needs the player's velocity. `TickTargetTracking()` estimates it by differencing consecutive frames and then low-pass filters it. The filter factor was written as **"advance 40% every frame"** — so its **time constant was measured in frames, not seconds**:
+Lead prediction needs the player's velocity, and velocity can only be estimated by differencing positions. Two independent problems sat on that path, and it took us two attempts to reach the bottom of it.
+
+#### First attempt: the filter's responsiveness was measured in frames, not seconds
+
+`TickTargetTracking()` low-pass filters the difference, and the filter factor was written as **"advance 40% every frame"** — so its **time constant was measured in frames, not seconds**:
 
 | Frame rate | Time constant |
 |---|---|
@@ -375,11 +379,60 @@ Lead prediction needs the player's velocity. `TickTargetTracking()` estimates it
 | 60 fps | 32.6 ms |
 | 30 fps | ~65 ms |
 
-The same filter left the velocity estimate **six times more sluggish** at a low frame rate. And since **lead = velocity × flight time**, a lagging velocity estimate is a wrong lead.
+The same code left the velocity estimate **six times more sluggish** at a low frame rate. And since **lead = velocity × flight time**, a lagging velocity estimate is a wrong lead.
 
 **This is the direct cause of the AI being noticeably stronger in the Editor and noticeably weaker in the standalone build.** The causation was confirmed by measurement: shrinking the build's window to raise its frame rate immediately restored the AI's strength.
 
-Fix: the filter factor is now delta-time compensated, so its time constant is the same at **every** frame rate. The value was then set by measurement — **less smoothing proved more accurate**, meaning lag hurts more than noise in this scenario.
+**First fix:** the filter factor was made delta-time compensated, so its time constant is the same at every frame rate, with the value set by measurement to smooth as little as possible.
+
+#### Second attempt: the real problem was the input, not the filter
+
+The first fix removed the frame-rate dependence, but left **a contradiction**: by our reasoning, less smoothing should mean more noise reaching the estimate, yet measurement said the opposite — **less smoothing was more accurate**.
+
+**That meant our model of the input's noise was wrong.** Following it down led to the actual root cause — **a unit mismatch**:
+
+| Fact | Source |
+|---|---|
+| The target's pose advances at the physics rate, **50 Hz** | `ProjectSettings` Fixed Timestep = 0.02 |
+| Movement and turning both run in `FixedUpdate` via `MovePosition` / `MoveRotation` | `TankMovement` |
+| The pose is **not interpolated for rendering** | `Tank.prefab` Rigidbody `m_Interpolate: 0` |
+| The AI samples it at the **render** rate | `TickTargetTracking()` |
+
+The two rates do not divide evenly, so each frame's displacement is a **whole number of physics steps** — sometimes one step, sometimes none — while the code divided it by a **render frame time**:
+
+```
+0.24 m ÷ 0.0167 s = 14.4 m/s     ← numerator is one physics step, denominator one render frame
+0.24 m ÷ 0.02   s = 12   m/s     ← the correct denominator
+```
+
+**The raw reading was therefore not "noisy" but "systematically wrong"** — about 20% high, and intermittently zero.
+
+**A filter can suppress that, but it cannot remove it.** This also explains why no amount of tuning the smoothing worked well: we were **papering over an input that did not need to be bad.**
+
+#### Final fix: correct the measurement instead of tuning the filter
+
+Sample only when the physics step has actually advanced, and divide by the physics time that actually elapsed:
+
+```csharp
+float elapsed = (float)(Time.fixedTimeAsDouble - m_LastFixedTime);
+if (elapsed <= 0f)
+    return;                                   // no physics step → do not sample
+
+TargetVelocity = (Target.position - m_PrevTargetPosition) / elapsed;
+```
+
+**The key gain is that a zero displacement now has exactly one meaning:**
+
+| Why the displacement is zero | Old code | New code |
+|---|---|---|
+| The physics step has not run yet | reports 0 ✗ **false reading** | **skipped entirely** ✓ |
+| The target genuinely stood still | reports 0 ✓ | reports 0 ✓ |
+
+The old code could not tell these apart, so it read "no new information yet" as "the target has no velocity".
+
+**Once the input is exact there is nothing left to smooth**, so the filter was deleted along with its two fields. The net result is **two fewer fields, one fewer tuning knob and one fewer concept**, and the frame-rate dependence goes from "compensated for" to "structurally absent".
+
+> **This version rests on an assumption:** that the target's pose changes only on physics steps. All three facts above hold today, but it is a **coupling**, not a general truth — enabling render interpolation or moving the tank another way would defeat the sampling gate, and it would **fail silently** (readings repeating or zeroing rather than an obvious error).
 
 ### A hypothesis the measurements disproved (recorded honestly)
 
@@ -389,18 +442,42 @@ But **we had underestimated the tolerance by an order of magnitude**. The real t
 
 So the extra 0.9 m of margin that 0.7 buys is **never used**, while it costs a **7% slower shell**. **Measurements kept 1.0.** It is recorded here because the reasoning chain looked rigorous and was wrong — a reminder to check magnitudes before acting on an argument.
 
-## 4.4 Limitations
+## 4.4 Iteration history: five rounds on the hit rate
+
+The hit rate did not arrive in one step. Each round is recorded below as **symptom → hypothesis → change → outcome**, **including the rounds that went the wrong way**, because it was a leftover contradiction that eventually pointed at the root cause.
+
+| Round | Commit | Symptom at the time | Hypothesis and change | Outcome / what remained |
+|---|---|---|---|---|
+| **1** | `b7ca61d` | Could not catch the player; went a whole round without firing | Built the FSM; lead used a **linear** model (velocity only, 8 fixed re-estimations); force used the "lands at y = 0" formula | Could shoot at all. **Left over:** any turn by the player put the predicted point off |
+| **2** | `e9aca73` | Lost the target as soon as it turned | Included **angular velocity** and stepped out a **curved** path; switched the force model to a controllable intercept height | Could track turns. **Left over:** a systematic miss persisted |
+| **3** | `31c913b` | Moving targets were "always a bit short" | Traced to two implementation biases: ① the timing tolerance's **early return** stopped every shot on the late side ② the tolerance was a **constant angle**, so lateral error grew with range | Lead bias 0.33–0.60 m → ≈ 0; lateral error at 39 m 1.67 m → 0.50 m. **Left over:** fire rate fell; the build was weaker than the Editor |
+| **4** | `784bf05` | ① Fire rate dropped ② **the build was clearly weaker than the Editor** | ① Tolerance 0.5 → 0.75 m (still inside the collider radius, keeping the accuracy fix) ② found the filter's **time constant was counted in frames** and made it delta-time compensated | Fire rate recovered; **the frame-rate effect disappeared**. **Left over:** a contradiction we could not explain (below) |
+| **5** | `d0bd33b` | After round 4, **measurement and reasoning pointed opposite ways**: less smoothing should have meant more noise, yet less smoothing measured more accurate | Treated the unexplained observation as a clue rather than noise, and found a **unit mismatch** (physics-step displacement ÷ render frame time); switched to **sampling on the physics step** and deleted the filter | The velocity estimate became **exact**; two fewer fields, one fewer knob, one fewer concept |
+
+### The two things worth taking from this sequence
+
+**① Round 5 was found through the contradiction round 4 left behind.**
+
+After round 4 the metrics were already acceptable. Had the fact that **measurement contradicted our reasoning** not been written down and treated as a clue, we would have stopped there — and never found the unit mismatch that was actually corrupting the input.
+
+**Treating an unexplained observation as a clue rather than as noise was the single most useful habit on this line of work.** It is also worth noting that round 5 **replaced** round 4 rather than extending it: round 4 made the filter frame-rate independent, which was correct as far as it went, but it was still **filtering an input that did not need to be noisy**.
+
+**② Round 3's lesson is to check the magnitude before touching a parameter.**
+
+See the disproved hypothesis at the end of the previous section: the reasoning chain looked rigorous, but it treated a 0.195 m radius as the tolerance when the real tolerance was about 1.1 m — nearly an order of magnitude out. **Acting on that reasoning directly would have produced a well-argued but wrong conclusion.**
+
+## 4.5 Limitations
 
 Ordered by magnitude of impact:
 
-- 🔴 **The velocity difference is aliased.** The player's position is advanced by the physics engine at **50 Hz** (`Rigidbody.MovePosition` in `FixedUpdate`) and is **not interpolated for rendering** (`m_Interpolate: 0`), while the AI samples it at the **render** rate. Each frame's displacement is therefore a whole number of physics steps, but the code divides it by a **render frame time** — a **unit mismatch**. At 60 fps the resulting speed reads 14.4 m/s where the true value is 12, and drops to zero on frames that contain no physics step. **The low-pass filter is currently papering over this bad input.** Located but **not yet fixed**; the fix is to sample on the physics step and drop the filter entirely. **The magnitude of this one is not yet measured.**
-- 🔴 **The prediction assumes the player holds their current linear and angular velocity.** When the player accelerates, decelerates or changes turn direction, the prediction is off by up to **metres** — far beyond the 0.1–0.75 m corrections above. This and the item above are the joint dominant remaining sources of uncertainty in our hit rate.
+- 🔴 **The prediction assumes the player holds their current linear and angular velocity.** When the player accelerates, decelerates or changes turn direction, the prediction is off by up to **metres** — far beyond the 0.1–0.75 m corrections above. **This is the dominant remaining source of uncertainty in our hit rate.**
 - 🟡 **Physical ramming and self-damage.** Both interception and counter-orbiting aim for head-on meetings, and ally spacing only constrains AI-versus-AI distances. With `MinFireRange = 0`, point-blank fire takes splash damage from the AI's own shell (a deliberate trade-off).
 - 🟡 **God's-eye perception.** The AI reads the player's position and velocity directly, with no field of view, occlusion or range limit. Line of sight is still checked before firing, so it cannot shoot through walls — but strictly speaking the AI is aware of a target it cannot see.
 - 🟢 **`AcquireRange` is a dead field**, read nowhere in the project; `SelectTarget()` picks the nearest target unconditionally.
 - 🟢 **The barrel elevation is cached in `Awake()`**, while the shell launches along the live barrel orientation. In normal play `RotateTowards` levels the hull every frame so the two agree, but hull pitch from a collision or a slope would desynchronise them.
+- 🟢 **The velocity estimate is coupled to an assumption**: that the target's pose changes only on physics steps (`FixedUpdate` + `MovePosition`/`MoveRotation`, and Rigidbody `m_Interpolate: 0`; see defect 3 in §4.3). That holds today, but it is not a general truth — enabling render interpolation or moving the tank another way would defeat the sampling gate, and it would **fail silently** (readings repeating or zeroing rather than an obvious error).
 
-## 4.5 Reflection: the preconditions this strategy depends on
+## 4.6 Reflection: the preconditions this strategy depends on
 
 We should acknowledge an element of winning on an uneven footing.
 
@@ -416,15 +493,14 @@ The consequence is that **the AI comes under far less fire than in a typical sho
 
 In other words, **this design is optimised for one specific constraint: that the player's mobility and firepower are tightly coupled.** Relax that constraint and the priority ordering (kill ≫ survive) has to be re-evaluated. This also explains why the design **does not treat AI survival as a first-class objective** — not an oversight, but a reasonable trade under the given rules.
 
-## 4.6 Improvements
+## 4.7 Improvements
 
-1. **Remove the aliasing in the velocity difference** (see the first item of §4.4). Sample on the physics step and divide by `Time.fixedDeltaTime`, so the input is correct first; the smoothing filter can then be deleted outright — one change removing the aliasing, the lag and the filter together. **This is the highest-value item.**
-2. **Remove the constant-velocity assumption.** Options: handle player turns conservatively (rather than risk a wild shot, hold fire), shorten the effective prediction window, or bound the error introduced by turning.
-3. **Limited perception.** Gate `SelectTarget()` on a field of view or range instead of the current god's-eye model. The assignment does not forbid omniscience, but explicitly modelling perception is a genuine AI-quality improvement.
-4. **Survival coordination** (if the precondition above relaxes). Alternating cover, bounding advance, damaged tanks disengaging.
-5. **Recompute the barrel elevation at runtime**, removing the model desynchronisation caused by hull pitch.
-6. **Remove the dead `AcquireRange` field.**
-7. **Collect post-fix test data** (necessary) — all existing data predates the fix commit.
+1. **Remove the constant-velocity assumption** (**highest value**). This is now the dominant remaining error source (§4.5). Options: handle player turns conservatively (rather than risk a wild shot, hold fire), shorten the effective prediction window, or bound the error introduced by turning.
+2. **Limited perception.** Gate `SelectTarget()` on a field of view or range instead of the current god's-eye model. The assignment does not forbid omniscience, but explicitly modelling perception is a genuine AI-quality improvement.
+3. **Survival coordination** (if the precondition above relaxes). Alternating cover, bounding advance, damaged tanks disengaging.
+4. **Recompute the barrel elevation at runtime**, removing the model desynchronisation caused by hull pitch.
+5. **Remove the dead `AcquireRange` field.**
+6. **Collect post-fix test data** (necessary) — all existing data predates this round's fix commits.
 
 ---
 
@@ -458,7 +534,7 @@ In other words, **this design is optimised for one specific constraint: that the
 | Engagement radius | 8 m (pusher) / 10 m (flanker) |
 | Damaged retreat | HP < 35% → radius ×1.4 |
 | Aim tolerance | ≤ 8 m: 3.5°; > 8 m: 0.75 m lateral (inside the ~0.9 m effective collider radius) |
-| Velocity smoothing time constant | 8.2 ms (frame-rate independent; set by `VelocitySmoothingReferenceFps` = 240) |
+| Velocity sampling | On the physics step (50 Hz), divided by the physics time actually elapsed |
 | Intercept-height factor | 1.0 |
 
 # Appendix C: Supporting documents
